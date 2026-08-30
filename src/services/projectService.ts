@@ -1,4 +1,5 @@
-import { Project, ProjectStatus, RiskLevel, Sector } from '../types';
+import { Project } from '../types';
+import { supabase } from '../lib/supabase';
 
 export interface ProjectFilters {
   searchQuery?: string;
@@ -22,100 +23,119 @@ export interface PaginatedProjectsResult {
   totalPages: number;
 }
 
-const getHeaders = () => {
-  const token = localStorage.getItem('sentinel_token');
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`
-  };
-};
-
 export const projectService = {
   getAllProjects: async (): Promise<Project[]> => {
-    const res = await fetch('/api/projects', { headers: getHeaders() });
-    if (!res.ok) throw new Error('Failed to fetch projects');
-    return await res.json();
+    // Note: With 53,162 records, fetching all is dangerous, but kept for compatibility.
+    // In a real app, this should only fetch a limited number or use infinite scroll.
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .limit(1000); // Limit to 1000 to prevent crashing the browser
+      
+    if (error) throw new Error(error.message);
+    return data as Project[];
   },
 
   getProjectById: async (id: string): Promise<Project | null> => {
-    const res = await fetch(`/api/projects/${id}`, { headers: getHeaders() });
-    if (!res.ok) return null;
-    return await res.json();
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('projectId', id)
+      .single();
+      
+    if (error) {
+      // Fallback check for refCode
+      const { data: refData, error: refError } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('refCode', id)
+        .single();
+        
+      if (refError) return null;
+      return refData as Project;
+    }
+    
+    return data as Project;
   },
 
   filterProjects: async (filters: ProjectFilters): Promise<PaginatedProjectsResult> => {
-    const allProjects = await projectService.getAllProjects();
-    let filtered = [...allProjects];
+    const page = filters.page || 1;
+    const pageSize = filters.pageSize || 10;
+    const startIndex = (page - 1) * pageSize;
+    const endIndex = startIndex + pageSize - 1;
 
+    let query = supabase
+      .from('projects')
+      .select('*', { count: 'exact' });
+
+    // Apply Filters
     if (filters.searchQuery && filters.searchQuery.trim()) {
-      const q = filters.searchQuery.toLowerCase().trim();
-      filtered = filtered.filter(
-        (p) =>
-          p.projectId.toLowerCase().includes(q) ||
-          p.title.toLowerCase().includes(q) ||
-          p.mpName.toLowerCase().includes(q) ||
-          p.state.toLowerCase().includes(q) ||
-          p.district.toLowerCase().includes(q) ||
-          p.constituency.toLowerCase().includes(q) ||
-          (p.workDescription && p.workDescription.toLowerCase().includes(q)) ||
-          p.implementingAgency.toLowerCase().includes(q) ||
-          (p.refCode && p.refCode.toLowerCase().includes(q))
-      );
+      const q = `%${filters.searchQuery.trim()}%`;
+      query = query.or(`projectId.ilike.${q},title.ilike.${q},mpName.ilike.${q},state.ilike.${q},district.ilike.${q},constituency.ilike.${q},implementingAgency.ilike.${q}`);
     }
 
     if (filters.status && filters.status !== 'All' && filters.status !== 'All Statuses') {
-      filtered = filtered.filter((p) => p.status.toLowerCase() === filters.status!.toLowerCase());
+      query = query.eq('status', filters.status);
     }
 
     if (filters.riskLevel && filters.riskLevel !== 'All' && filters.riskLevel !== 'All Risk Levels') {
-      filtered = filtered.filter((p) => p.riskLevel.toLowerCase() === filters.riskLevel!.toLowerCase());
+      query = query.eq('riskLevel', filters.riskLevel);
     }
 
     if (filters.financialYear && filters.financialYear !== 'All' && filters.financialYear !== 'All Years') {
-      filtered = filtered.filter((p) => p.financialYear === filters.financialYear);
+      query = query.eq('financialYear', filters.financialYear);
     }
 
     if (filters.sector && filters.sector !== 'All' && filters.sector !== 'All Sectors') {
-      filtered = filtered.filter((p) => p.sector.toLowerCase() === filters.sector!.toLowerCase());
+      query = query.eq('sector', filters.sector);
     }
 
     if (filters.state && filters.state !== 'All' && filters.state !== 'All States') {
-      filtered = filtered.filter((p) => p.state.toLowerCase() === filters.state!.toLowerCase());
+      query = query.eq('state', filters.state);
     }
 
     if (filters.district && filters.district !== 'All' && filters.district !== 'All Districts') {
-      filtered = filtered.filter((p) => p.district.toLowerCase() === filters.district!.toLowerCase());
+      query = query.eq('district', filters.district);
     }
 
-    // Sorting
-    const sortBy = filters.sortBy || 'riskScore';
-    const sortOrder = filters.sortOrder || 'desc';
+    // Apply Sorting
+    const sortOrder = filters.sortOrder === 'asc';
+    switch (filters.sortBy) {
+      case 'recommendedAmount':
+        query = query.order('sanctionedAmountLakhs', { ascending: sortOrder });
+        break;
+      case 'totalPaid':
+        query = query.order('spentAmountLakhs', { ascending: sortOrder });
+        break;
+      case 'riskScore':
+        query = query.order('riskScore', { ascending: sortOrder });
+        break;
+      case 'recommendationDate':
+        query = query.order('recommendationDate', { ascending: sortOrder });
+        break;
+      case 'progress':
+        query = query.order('physicalProgressPercent', { ascending: sortOrder });
+        break;
+      default:
+        query = query.order('riskScore', { ascending: false }); // Default sort
+        break;
+    }
 
-    filtered.sort((a, b) => {
-      let comparison = 0;
-      if (sortBy === 'recommendedAmount') {
-        comparison = (a.sanctionedAmountLakhs || 0) - (b.sanctionedAmountLakhs || 0);
-      } else if (sortBy === 'totalPaid') {
-        comparison = (a.spentAmountLakhs || 0) - (b.spentAmountLakhs || 0);
-      } else if (sortBy === 'riskScore') {
-        comparison = (a.riskScore || 0) - (b.riskScore || 0);
-      } else if (sortBy === 'recommendationDate') {
-        comparison = new Date(a.recommendationDate || 0).getTime() - new Date(b.recommendationDate || 0).getTime();
-      } else if (sortBy === 'progress') {
-        comparison = (a.physicalProgressPercent || 0) - (b.physicalProgressPercent || 0);
-      }
-      return sortOrder === 'asc' ? comparison : -comparison;
-    });
+    // Apply Pagination
+    query = query.range(startIndex, endIndex);
 
-    const totalCount = filtered.length;
-    const page = filters.page || 1;
-    const pageSize = filters.pageSize || 10;
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error("Supabase query error:", error);
+      throw new Error(error.message);
+    }
+
+    const totalCount = count || 0;
     const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
-    const startIndex = (page - 1) * pageSize;
-    const paginated = filtered.slice(startIndex, startIndex + pageSize);
 
     return {
-      projects: paginated,
+      projects: data as Project[],
       totalCount,
       page,
       pageSize,
@@ -123,17 +143,18 @@ export const projectService = {
     };
   },
 
-  // Stub out mutations to just return the current project for now, 
-  // since this requires backend endpoints we haven't built in this scope.
   updateProjectStatus: async (projectId: string, updates: any): Promise<Project> => {
+    // Stub implementation for now
     return (await projectService.getProjectById(projectId)) as Project;
   },
 
   addEvidencePhoto: async (projectId: string, evidenceData: any): Promise<Project> => {
+    // Stub implementation for now
     return (await projectService.getProjectById(projectId)) as Project;
   },
 
   createProject: async (newProject: any): Promise<Project> => {
+    // Stub implementation for now
     return { ...newProject } as Project;
   },
 
